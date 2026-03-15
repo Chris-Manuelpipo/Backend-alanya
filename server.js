@@ -5,6 +5,16 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
+const admin = require('firebase-admin');
+
+// Initialiser Firebase Admin avec le Service Account
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -15,6 +25,48 @@ app.get('/', (_, res) => res.send('Talky Signaling Server ✅'));
 
 // ── Map userId → socketId ──────────────────────────────────────────────
 const users = new Map(); // userId → socketId
+
+app.use(express.json());
+
+app.post('/notify', async (req, res) => {
+  try {
+    const { toUserId, title, body, type, conversationId, callerId } = req.body;
+
+    // Lire le fcmToken du destinataire dans Firestore
+    const userDoc = await db.collection('users').doc(toUserId).get();
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+
+    const fcmToken = userDoc.data().fcmToken;
+    if (!fcmToken) return res.status(400).json({ error: 'No FCM token' });
+
+    // Construire le message FCM
+    const message = {
+      token: fcmToken,
+      notification: { title, body },
+      data: {
+        type:           type ?? 'message',
+        conversationId: conversationId ?? '',
+        callerId:       callerId ?? '',
+      },
+      android: {
+        priority: type === 'call' ? 'high' : 'normal',
+        notification: {
+          sound:       'default',
+          channelId:   type === 'call' ? 'talky_calls' : 'talky_messages',
+          priority:    type === 'call' ? 'max' : 'high',
+          visibility:  'public',
+        },
+      },
+    };
+
+    await admin.messaging().send(message);
+    res.json({ success: true });
+
+  } catch (e) {
+    console.error('[notify] Error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 io.on('connection', (socket) => {
     console.log(`[+] Connected: ${socket.id}`);
