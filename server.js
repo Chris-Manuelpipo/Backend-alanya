@@ -74,6 +74,7 @@ app.post('/notify', async (req, res) => {
           // FCM data values must be strings
           sound:       'default',
           channelId:   (type === 'call' || type === 'group_call') ? 'calls' : 'messages',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
           priority:    (type === 'call' || type === 'group_call') ? 'max' : 'high',
           visibility:  'public',
         },
