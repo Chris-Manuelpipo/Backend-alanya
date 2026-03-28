@@ -61,18 +61,19 @@ app.post('/notify', async (req, res) => {
       token: fcmToken,
       notification: { title, body },
       data: {
-        type:           type ?? 'message',
-        conversationId: conversationId ?? '',
-        callerId:       callerId ?? '',
-        callerName:     title ?? '',
-        roomId:         req.body.roomId ?? '',
-        isVideo:        req.body.isVideo ?? false,
+        type:           String(type ?? 'message'),
+        conversationId: String(conversationId ?? ''),
+        callerId:       String(callerId ?? ''),
+        callerName:     String(title ?? ''),
+        roomId:         String(req.body.roomId ?? ''),
+        isVideo:        String(req.body.isVideo ?? false),
       },
       android: {
         priority: (type === 'call' || type === 'group_call') ? 'high' : 'normal',
         notification: {
+          // FCM data values must be strings
           sound:       'default',
-          channelId:   (type === 'call' || type === 'group_call') ? 'talky_calls' : 'talky_messages',
+          channelId:   (type === 'call' || type === 'group_call') ? 'calls' : 'messages',
           priority:    (type === 'call' || type === 'group_call') ? 'max' : 'high',
           visibility:  'public',
         },
