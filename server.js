@@ -1,11 +1,6 @@
 require('dotenv').config();
 
 // ── Firebase Admin — DOIT être initialisé avant tout require de route/middleware ──
-//
-// Deux sources supportées :
-//   1. Fichier local `serviceAccountKey.json` (dev)
-//   2. Variable d'env `FIREBASE_SERVICE_ACCOUNT` au format JSON (prod / Render /
-//      Railway / etc.) — les \n des private_key sont gérés automatiquement.
 const admin = require('firebase-admin');
 
 function loadFirebaseCredentials() {
@@ -42,7 +37,7 @@ const cors = require('cors');
 const errorHandler = require('./src/middleware/errorHandler');
 
 const authRoutes         = require('./src/routes/auth');
-const paysRoutes        = require('./src/routes/pays');
+const paysRoutes         = require('./src/routes/pays');
 const userRoutes         = require('./src/routes/users');
 const conversationRoutes = require('./src/routes/conversations');
 const messageRoutes      = require('./src/routes/messages');
@@ -53,8 +48,27 @@ const meetingRoutes      = require('./src/routes/meetings');
 const notifyRoutes       = require('./src/routes/notify');
 
 const registerAuthHandler = require('./src/socket/handlers/auth');
-const { joinConversation, messageSend, typingStart, typingStop, presenceOnline, presenceOffline, handleDisconnect } = require('./src/socket/handlers/chat');
-const { callUser, answerCall, rejectCall, iceCandidate, endCall: endCallWebRTC } = require('./src/socket/handlers/calls');
+const {
+  joinConversation, messageSend, typingStart, typingStop,
+  presenceOnline, presenceOffline, handleDisconnect,
+} = require('./src/socket/handlers/chat');
+
+// ── Handlers appels — protocole aligné sur Flutter CallService ────────
+const {
+  callUser,
+  answerCall,
+  rejectCall,
+  iceCandidate,
+  endCall,
+  createGroupCall,
+  joinGroupCall,
+  leaveGroupCall,
+  endGroupCall,
+  groupOffer,
+  groupAnswer,
+  groupIceCandidate,
+} = require('./src/socket/handlers/calls');
+
 const {
   meetingCreate, meetingJoinRequest, meetingJoinAccept, meetingJoinDecline,
   meetingStart, meetingEnd, meetingChat,
@@ -75,7 +89,7 @@ app.use(cors());
 app.use(express.json());
 
 app.use('/api/auth',          authRoutes);
-app.use('/api/pays',         paysRoutes);
+app.use('/api/pays',          paysRoutes);
 app.use('/api/users',         userRoutes);
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/conversations', messageRoutes);
@@ -92,20 +106,34 @@ app.use(errorHandler);
 io.on('connection', (socket) => {
   console.log('[Socket] Client connecté:', socket.id);
 
+  // ── Auth & présence ─────────────────────────────────────────────
   registerAuthHandler(io, socket, userSockets);
+  presenceOnline(io, socket, userSockets);
+  presenceOffline(io, socket, userSockets);
+
+  // ── Messagerie ──────────────────────────────────────────────────
   joinConversation(io, socket, userSockets);
   messageSend(io, socket, userSockets);
   typingStart(io, socket, userSockets);
   typingStop(io, socket, userSockets);
-  presenceOnline(io, socket, userSockets);
-  presenceOffline(io, socket, userSockets);
 
+  // ── Appels 1-à-1 ────────────────────────────────────────────────
   callUser(io, socket, userSockets);
   answerCall(io, socket, userSockets);
   rejectCall(io, socket, userSockets);
   iceCandidate(io, socket, userSockets);
-  endCallWebRTC(io, socket, userSockets);
+  endCall(io, socket, userSockets);
 
+  // ── Appels de groupe ────────────────────────────────────────────
+  createGroupCall(io, socket, userSockets);
+  joinGroupCall(io, socket, userSockets);
+  leaveGroupCall(io, socket, userSockets);
+  endGroupCall(io, socket, userSockets);
+  groupOffer(io, socket, userSockets);
+  groupAnswer(io, socket, userSockets);
+  groupIceCandidate(io, socket, userSockets);
+
+  // ── Meetings (API séparée des appels) ───────────────────────────
   meetingCreate(io, socket, userSockets);
   meetingJoinRequest(io, socket, userSockets);
   meetingJoinAccept(io, socket, userSockets);

@@ -1,24 +1,104 @@
-const webrtcService = require('../../services/webrtcService');
+// src/socket/handlers/calls.js
+//
+// Protocole aligné sur Flutter CallService (call_service.dart).
+//
+// ── Appels 1-à-1 ─────────────────────────────────────────────────────
+//
+// Flutter → Serveur
+//   call_user        { targetUserId, callerId, callerName, callerPhoto, isVideo, offer:{sdp,type} }
+//   answer_call      { callerId, answer:{sdp,type} }
+//   reject_call      { callerId }
+//   end_call         { targetUserId }
+//   ice_candidate    { targetUserId, candidate:{candidate,sdpMid,sdpMLineIndex} }
+//
+// Serveur → Flutter
+//   incoming_call    { callerId, callerName, callerPhoto, isVideo, offer:{sdp,type} }
+//   call_answered    { answer:{sdp,type} }
+//   call_rejected    {}
+//   call_ended       {}
+//   ice_candidate    { candidate:{candidate,sdpMid,sdpMLineIndex} }
+//
+// ── Appels de groupe ─────────────────────────────────────────────────
+//
+// Flutter → Serveur
+//   create_group_call  { roomId, callerId, callerName, callerPhoto, isVideo, targetUserIds:[] }
+//   join_group_call    { roomId, userId, userName, userPhoto }
+//   leave_group_call   { roomId }
+//   end_group_call     { roomId }
+//   group_offer        { roomId, fromUserId, toUserId, offer:{sdp,type} }
+//   group_answer       { roomId, fromUserId, toUserId, answer:{sdp,type} }
+//   group_ice_candidate{ roomId, fromUserId, toUserId, candidate:{...} }
+//
+// Serveur → Flutter
+//   group_call_invite  { callerId, callerName, callerPhoto, isVideo, roomId }
+//   group_user_joined  { roomId, userId, userName, userPhoto }
+//   group_participants { roomId, participants:[] }
+//   group_offer        { fromUserId, offer:{sdp,type} }
+//   group_answer       { fromUserId, answer:{sdp,type} }
+//   group_ice_candidate{ fromUserId, candidate:{...} }
+//   group_call_ended   {}
+//   group_user_left    { roomId, userId }
+
 const pool = require('../../config/db');
+
+// ── State en mémoire des rooms de groupe ─────────────────────────────
+// roomId → Map<alanyaID, { userName, userPhoto }>
+const groupRooms = new Map();
+
+// ── Helper ────────────────────────────────────────────────────────────
+function toInt(v) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? null : n;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  APPELS 1-À-1
+// ─────────────────────────────────────────────────────────────────────
 
 const callUser = (io, socket, userSockets) => {
   socket.on('call_user', async (data) => {
     try {
-      const { callID, callerID, callerName, receiverID, isVideo } = data;
-      const receiverSocket = userSockets.get(receiverID);
-      
-      webrtcService.createCall(callID, callerID, receiverID);
-      
-      if (receiverSocket) {
-        io.to(receiverSocket).emit('incoming_call', {
-          callID,
-          callerID,
-          callerName,
-          isVideo,
+      const { targetUserId, callerId, callerName, callerPhoto, isVideo, offer } = data;
+
+      const targetID = toInt(targetUserId);
+      const callerID = toInt(callerId);
+
+      if (!targetID || !callerID || !offer) {
+        socket.emit('call_failed', { reason: 'Données d\'appel invalides' });
+        return;
+      }
+
+      // Créer l'entrée callHistory en base (status 0 = missed par défaut,
+      // mis à jour lors du décrochage ou de la fin)
+      try {
+        const [result] = await pool.execute(
+          `INSERT INTO callHistory (idCaller, idReceiver, type, status, created_at, start_time)
+           VALUES (?, ?, ?, 0, NOW(), NOW())`,
+          [callerID, targetID, isVideo ? 1 : 0]
+        );
+        // On stocke l'IDcall sur le socket pour le retrouver lors de end_call
+        socket.currentCallID = result.insertId;
+      } catch (dbErr) {
+        console.warn('[Socket call_user] DB insert failed:', dbErr.message);
+        // On continue — le signaling fonctionne même si le log DB échoue
+      }
+
+      const targetSocketId = userSockets.get(targetID);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('incoming_call', {
+          callerId:    String(callerID),
+          callerName:  callerName  ?? '',
+          callerPhoto: callerPhoto ?? null,
+          isVideo:     isVideo     ?? false,
+          offer,                          // ← SDP offer forwardé tel quel
         });
+      } else {
+        // Destinataire hors ligne — FCM géré côté Flutter (FcmSender)
+        socket.emit('call_failed', { reason: 'Utilisateur non disponible' });
       }
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      console.error('[Socket call_user]', error.message);
+      socket.emit('call_failed', { reason: error.message });
     }
   });
 };
@@ -26,66 +106,316 @@ const callUser = (io, socket, userSockets) => {
 const answerCall = (io, socket, userSockets) => {
   socket.on('answer_call', async (data) => {
     try {
-      const { callID, callerID, receiverID, accept } = data;
-      const callerSocket = userSockets.get(callerID);
+      const { callerId, answer } = data;
 
-      webrtcService.updateCallStatus(callID, accept ? 'active' : 'rejected');
+      const callerID = toInt(callerId);
+      if (!callerID || !answer) return;
 
-      // Marque le VRAI début de l'appel (décrochage) pour que la durée
-      // calculée dans endCall exclue le temps de sonnerie.
-      if (accept) {
-        try {
-          await pool.execute(
-            'UPDATE callHistory SET start_time = NOW(), status = 1 WHERE IDcall = ?',
-            [callID]
-          );
-        } catch (e) {
-          console.warn('[Socket answerCall] update start_time failed:', e.message);
-        }
+      // Mettre à jour le vrai début de l'appel (décrochage)
+      // On cherche l'IDcall le plus récent entre ces deux utilisateurs
+      try {
+        await pool.execute(
+          `UPDATE callHistory
+           SET start_time = NOW(), status = 1
+           WHERE idCaller = ? AND idReceiver = ?
+           ORDER BY created_at DESC LIMIT 1`,
+          [callerID, toInt(socket.alanyaID)]
+        );
+      } catch (dbErr) {
+        console.warn('[Socket answer_call] DB update failed:', dbErr.message);
       }
 
-      if (callerSocket) {
-        io.to(callerSocket).emit('call_answered', {
-          callID,
-          accept,
-          receiverID,
-        });
+      const callerSocketId = userSockets.get(callerID);
+      if (callerSocketId) {
+        io.to(callerSocketId).emit('call_answered', { answer }); // ← SDP answer forwardé
       }
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      console.error('[Socket answer_call]', error.message);
     }
   });
 };
 
 const rejectCall = (io, socket, userSockets) => {
-  socket.on('reject_call', (data) => {
-    const { callID, callerID, receiverID } = data;
-    const callerSocket = userSockets.get(callerID);
-    
-    webrtcService.endCall(callID);
-    
-    if (callerSocket) {
-      io.to(callerSocket).emit('call_rejected', { callID, receiverID });
+  socket.on('reject_call', async (data) => {
+    try {
+      const { callerId } = data;
+      const callerID = toInt(callerId);
+      if (!callerID) return;
+
+      // Marquer l'appel comme refusé en base
+      try {
+        await pool.execute(
+          `UPDATE callHistory
+           SET status = 2
+           WHERE idCaller = ? AND idReceiver = ?
+           ORDER BY created_at DESC LIMIT 1`,
+          [callerID, toInt(socket.alanyaID)]
+        );
+      } catch (dbErr) {
+        console.warn('[Socket reject_call] DB update failed:', dbErr.message);
+      }
+
+      const callerSocketId = userSockets.get(callerID);
+      if (callerSocketId) {
+        io.to(callerSocketId).emit('call_rejected', {});
+      }
+    } catch (error) {
+      console.error('[Socket reject_call]', error.message);
     }
   });
 };
 
 const iceCandidate = (io, socket, userSockets) => {
   socket.on('ice_candidate', (data) => {
-    const { callID, candidate, targetUserID } = data;
-    const targetSocket = userSockets.get(targetUserID);
-    
-    if (targetSocket) {
-      io.to(targetSocket).emit('ice_candidate', { callID, candidate, from: socket.alanyaID });
+    try {
+      const { targetUserId, candidate } = data;
+      const targetID = toInt(targetUserId);
+      if (!targetID || !candidate) return;
+
+      const targetSocketId = userSockets.get(targetID);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('ice_candidate', { candidate });
+      }
+    } catch (error) {
+      console.error('[Socket ice_candidate]', error.message);
     }
   });
 };
 
 const endCall = (io, socket, userSockets) => {
-  socket.on('end_call', (data) => {
-    const { callID, userID } = data;
-    webrtcService.endCall(callID);
-    io.emit('call_ended', { callID, userID });
+  socket.on('end_call', async (data) => {
+    try {
+      const { targetUserId } = data;
+      const targetID  = toInt(targetUserId);
+      const callerID  = socket.alanyaID;
+
+      // Calculer la durée et fermer l'entrée en base
+      if (callerID) {
+        try {
+          await pool.execute(
+            `UPDATE callHistory
+             SET duree = GREATEST(0, TIMESTAMPDIFF(SECOND, start_time, NOW()))
+             WHERE (idCaller = ? OR idReceiver = ?)
+               AND (idCaller = ? OR idReceiver = ?)
+             ORDER BY created_at DESC LIMIT 1`,
+            [callerID, callerID, targetID ?? callerID, targetID ?? callerID]
+          );
+        } catch (dbErr) {
+          console.warn('[Socket end_call] DB update failed:', dbErr.message);
+        }
+      }
+
+      if (targetID) {
+        const targetSocketId = userSockets.get(targetID);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit('call_ended', {});
+        }
+      }
+
+      socket.currentCallID = null;
+    } catch (error) {
+      console.error('[Socket end_call]', error.message);
+    }
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────
+//  APPELS DE GROUPE
+// ─────────────────────────────────────────────────────────────────────
+
+const createGroupCall = (io, socket, userSockets) => {
+  socket.on('create_group_call', (data) => {
+    try {
+      const { roomId, callerId, callerName, callerPhoto, isVideo, targetUserIds } = data;
+      if (!roomId || !Array.isArray(targetUserIds)) return;
+
+      const callerID = toInt(callerId);
+      if (!callerID) return;
+
+      // Initialiser la room avec le créateur
+      groupRooms.set(roomId, new Map([[
+        callerID,
+        { userName: callerName ?? '', userPhoto: callerPhoto ?? null }
+      ]]));
+
+      socket.join(`group_${roomId}`);
+      socket.currentGroupRoom = roomId;
+
+      // Notifier chaque participant ciblé
+      for (const uid of targetUserIds) {
+        const targetID = toInt(uid);
+        if (!targetID) continue;
+        const targetSocketId = userSockets.get(targetID);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit('group_call_invite', {
+            callerId:    String(callerID),
+            callerName:  callerName  ?? '',
+            callerPhoto: callerPhoto ?? null,
+            isVideo:     isVideo     ?? false,
+            roomId,
+          });
+        }
+        // Hors ligne → FCM géré côté Flutter (FcmSender.sendGroupCallNotification)
+      }
+    } catch (error) {
+      console.error('[Socket create_group_call]', error.message);
+    }
+  });
+};
+
+const joinGroupCall = (io, socket, userSockets) => {
+  socket.on('join_group_call', (data) => {
+    try {
+      const { roomId, userId, userName, userPhoto } = data;
+      if (!roomId || !userId) return;
+
+      const userID = toInt(userId);
+      if (!userID) return;
+
+      // S'assurer que la room existe
+      if (!groupRooms.has(roomId)) {
+        groupRooms.set(roomId, new Map());
+      }
+
+      const room = groupRooms.get(roomId);
+      room.set(userID, { userName: userName ?? '', userPhoto: userPhoto ?? null });
+
+      socket.join(`group_${roomId}`);
+      socket.currentGroupRoom = roomId;
+
+      // Notifier les autres membres que quelqu'un a rejoint
+      socket.to(`group_${roomId}`).emit('group_user_joined', {
+        roomId,
+        userId:    String(userID),
+        userName:  userName  ?? '',
+        userPhoto: userPhoto ?? null,
+      });
+
+      // Envoyer la liste des participants actuels au nouvel entrant
+      const participants = Array.from(room.keys()).map(String);
+      socket.emit('group_participants', { roomId, participants });
+    } catch (error) {
+      console.error('[Socket join_group_call]', error.message);
+    }
+  });
+};
+
+const leaveGroupCall = (io, socket, userSockets) => {
+  socket.on('leave_group_call', (data) => {
+    try {
+      const { roomId } = data ?? {};
+      const room = roomId ? groupRooms.get(roomId) : null;
+
+      if (room && socket.alanyaID) {
+        room.delete(socket.alanyaID);
+        if (room.size === 0) groupRooms.delete(roomId);
+      }
+
+      const rId = roomId ?? socket.currentGroupRoom;
+      if (rId) {
+        socket.to(`group_${rId}`).emit('group_user_left', {
+          roomId: rId,
+          userId: String(socket.alanyaID),
+        });
+        socket.leave(`group_${rId}`);
+      }
+
+      socket.currentGroupRoom = null;
+    } catch (error) {
+      console.error('[Socket leave_group_call]', error.message);
+    }
+  });
+};
+
+const endGroupCall = (io, socket, userSockets) => {
+  socket.on('end_group_call', (data) => {
+    try {
+      const { roomId } = data ?? {};
+      const rId = roomId ?? socket.currentGroupRoom;
+      if (!rId) return;
+
+      groupRooms.delete(rId);
+      io.to(`group_${rId}`).emit('group_call_ended', {});
+
+      // Faire quitter tous les sockets de la room
+      const roomSockets = io.sockets.adapter.rooms.get(`group_${rId}`);
+      if (roomSockets) {
+        for (const sid of roomSockets) {
+          const s = io.sockets.sockets.get(sid);
+          if (s) {
+            s.leave(`group_${rId}`);
+            s.currentGroupRoom = null;
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[Socket end_group_call]', error.message);
+    }
+  });
+};
+
+// ── WebRTC peer-to-peer dans le groupe (relayé par le serveur) ────────
+
+const groupOffer = (io, socket, userSockets) => {
+  socket.on('group_offer', (data) => {
+    try {
+      const { toUserId, fromUserId, offer, roomId } = data;
+      const targetID = toInt(toUserId);
+      if (!targetID || !offer) return;
+
+      const targetSocketId = userSockets.get(targetID);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('group_offer', {
+          fromUserId: String(fromUserId ?? socket.alanyaID),
+          offer,
+          roomId,
+        });
+      }
+    } catch (error) {
+      console.error('[Socket group_offer]', error.message);
+    }
+  });
+};
+
+const groupAnswer = (io, socket, userSockets) => {
+  socket.on('group_answer', (data) => {
+    try {
+      const { toUserId, fromUserId, answer, roomId } = data;
+      const targetID = toInt(toUserId);
+      if (!targetID || !answer) return;
+
+      const targetSocketId = userSockets.get(targetID);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('group_answer', {
+          fromUserId: String(fromUserId ?? socket.alanyaID),
+          answer,
+          roomId,
+        });
+      }
+    } catch (error) {
+      console.error('[Socket group_answer]', error.message);
+    }
+  });
+};
+
+const groupIceCandidate = (io, socket, userSockets) => {
+  socket.on('group_ice_candidate', (data) => {
+    try {
+      const { toUserId, fromUserId, candidate, roomId } = data;
+      const targetID = toInt(toUserId);
+      if (!targetID || !candidate) return;
+
+      const targetSocketId = userSockets.get(targetID);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('group_ice_candidate', {
+          fromUserId: String(fromUserId ?? socket.alanyaID),
+          candidate,
+          roomId,
+        });
+      }
+    } catch (error) {
+      console.error('[Socket group_ice_candidate]', error.message);
+    }
   });
 };
 
@@ -95,4 +425,11 @@ module.exports = {
   rejectCall,
   iceCandidate,
   endCall,
+  createGroupCall,
+  joinGroupCall,
+  leaveGroupCall,
+  endGroupCall,
+  groupOffer,
+  groupAnswer,
+  groupIceCandidate,
 };

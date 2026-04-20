@@ -190,15 +190,20 @@ const getMe = async (req, res) => {
 
 const updateMe = async (req, res) => {
   try {
-    const { nom, pseudo, avatar_url, fcm_token, device_ID } = req.body;
+    const { nom, pseudo, avatar_url, fcm_token, device_ID, is_online } = req.body;
     const updates = [];
     const values = [];
 
-    if (nom) { updates.push('nom = ?'); values.push(nom); }
-    if (pseudo) { updates.push('pseudo = ?'); values.push(pseudo); }
-    if (avatar_url) { updates.push('avatar_url = ?'); values.push(avatar_url); }
+    if (nom)       { updates.push('nom = ?');       values.push(nom); }
+    if (pseudo)    { updates.push('pseudo = ?');    values.push(pseudo); }
+    if (avatar_url){ updates.push('avatar_url = ?'); values.push(avatar_url); }
     if (fcm_token) { updates.push('fcm_token = ?'); values.push(fcm_token); }
     if (device_ID) { updates.push('device_ID = ?'); values.push(device_ID); }
+    // is_online accepte 0 ou 1 — on teste !== undefined pour autoriser la valeur 0
+    if (is_online !== undefined) {
+      updates.push('is_online = ?, last_seen = NOW()');
+      values.push(is_online ? 1 : 0);
+    }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
