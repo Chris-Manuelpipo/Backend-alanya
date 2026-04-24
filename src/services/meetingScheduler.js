@@ -37,8 +37,8 @@ const checkAndNotifyUpcomingMeetings = async () => {
        FROM meeting m
        JOIN users u ON m.idOrganiser = u.alanyaID
        WHERE m.isEnd = 0
-         AND m.start_time > NOW()
-         AND m.start_time <= DATE_ADD(NOW(), INTERVAL 10 MINUTE AND 11 MINUTE)
+         AND m.start_time > NOW() 
+          AND m.start_time <= DATE_ADD(NOW(), INTERVAL 10 MINUTE)
          AND NOT EXISTS (
            SELECT 1 FROM participant p
            WHERE p.idMeeting = m.idMeeting 
