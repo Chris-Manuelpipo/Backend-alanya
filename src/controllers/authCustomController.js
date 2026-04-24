@@ -11,6 +11,7 @@ const generateAlanyaPhone = () => {
 
 const register = async (req, res) => {
   try {
+    console.log('[Register] req.body:', req.body);
     const { email, password, nom, pseudo, idPays, fcm_token, device_ID } = req.body;
 
     if (!email || !password) {
