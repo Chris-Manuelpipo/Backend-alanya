@@ -1,10 +1,10 @@
-// src/middleware/auth.js
 const admin = require('firebase-admin');
-const pool  = require('../config/db');
+const jwt = require('jsonwebtoken');
+const pool = require('../config/db');
 
-// Firebase Admin est initialisé une seule fois dans server.js
-// Ce middleware utilise l'instance déjà active via admin.auth()
+const JWT_SECRET = process.env.JWT_SECRET || 'talky-secret-key-change-in-production';
 
+// Middleware qui accepte Firebase OU custom JWT
 const auth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -13,33 +13,58 @@ const auth = async (req, res, next) => {
     }
 
     const token = authHeader.split('Bearer ')[1];
-    const decoded = await admin.auth().verifyIdToken(token);
 
-    // Deux sources possibles pour le phone :
-    //  - decoded.phone_number : user venu par OTP Firebase (claim natif)
-    //  - decoded.talky_phone  : custom claim posé par /auth/register pour
-    //    les users venus par Google (sans phone Firebase)
-    const phone = decoded.phone_number ?? decoded.talky_phone ?? null;
+    // Essayer d'abord le token custom JWT
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const [rows] = await pool.execute(
+        'SELECT alanyaID, alanyaPhone, email FROM users WHERE alanyaID = ?',
+        [decoded.alanyaID]
+      );
 
-    if (!phone) {
-      return res.status(401).json({ error: 'No phone claim in token' });
+      if (rows.length > 0) {
+        req.user = {
+          alanyaID: rows[0].alanyaID,
+          phone: rows[0].alanyaPhone,
+          email: rows[0].email,
+          authType: 'custom',
+        };
+        return next();
+      }
+    } catch (jwtError) {
+      // Token pas JWT → essayer Firebase
     }
 
-    const [rows] = await pool.execute(
-      'SELECT alanyaID, alanyaPhone FROM users WHERE alanyaPhone = ?',
-      [phone]
-    );
+    // Essayer Firebase token
+    try {
+      const decoded = await admin.auth().verifyIdToken(token);
+      const phone = decoded.phone_number ?? decoded.talky_phone ?? null;
 
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'User not found in DB' });
+      if (!phone) {
+        return res.status(401).json({ error: 'No phone claim in token' });
+      }
+
+      const [rows] = await pool.execute(
+        'SELECT alanyaID, alanyaPhone FROM users WHERE alanyaPhone = ?',
+        [phone]
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({ error: 'User not found in DB' });
+      }
+
+      req.user = {
+        uid: decoded.uid,
+        alanyaID: rows[0].alanyaID,
+        phone: rows[0].alanyaPhone,
+        authType: 'firebase',
+      };
+      return next();
+    } catch (fbError) {
+      // Les deux ont échoué
+      console.error('[Auth] Token verification failed:', fbError.message);
+      return res.status(401).json({ error: 'Invalid or expired token' });
     }
-
-    req.user = {
-      uid: decoded.uid,
-      alanyaID: rows[0].alanyaID,
-      phone: rows[0].alanyaPhone,
-    };
-    next();
   } catch (error) {
     console.error('[Auth] ERROR:', error.code, error.message);
     return res.status(401).json({ error: 'Invalid or expired token' });
