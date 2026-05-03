@@ -244,6 +244,42 @@ const inviteParticipants = async (req, res) => {
   }
 };
 
+const leaveMeeting = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const alanyaID = req.user.alanyaID;
+
+    // Mettre à jour le participant : connecte=0 et duree
+    await pool.execute(
+      `UPDATE participant 
+       SET connecte = 0, 
+           duree = TIMESTAMPDIFF(SECOND, start_time, NOW())
+       WHERE idMeeting = ? AND IDparticipant = ?`,
+      [id, alanyaID]
+    );
+
+    // Vérifier si plus aucun participant n'est connecté
+    const [connectedParticipants] = await pool.execute(
+      `SELECT COUNT(*) as count FROM participant 
+       WHERE idMeeting = ? AND connecte = 1`,
+      [id]
+    );
+
+    // Si aucun participant connecté, mettre la réunion en end
+    if (connectedParticipants[0].count === 0) {
+      await pool.execute(
+        `UPDATE meeting SET isEnd = 1 WHERE idMeeting = ?`,
+        [id]
+      );
+      console.log(`[Meeting] Meeting ${id} ended - no more connected participants`);
+    }
+
+    res.json({ message: 'Left meeting' });
+  } catch (error) {
+    throw error;
+  }
+};
+
 module.exports = {
   getMeetings,
   createMeeting,
@@ -254,4 +290,5 @@ module.exports = {
   acceptJoinRequest,
   declineJoinRequest,
   inviteParticipants,
+  leaveMeeting,
 };

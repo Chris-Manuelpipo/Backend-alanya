@@ -4,11 +4,11 @@ const getCalls = async (req, res) => {
   try {
     const alanyaID = req.user.alanyaID;
     const [rows] = await pool.execute(
-      `SELECT c.*, 
+      `SELECT c.*,
               u1.nom as caller_nom, u1.pseudo as caller_pseudo, u1.avatar_url as caller_avatar,
               u2.nom as receiver_nom, u2.pseudo as receiver_pseudo, u2.avatar_url as receiver_avatar
        FROM callHistory c
-       JOIN users u1 ON c.idCaller = u1.alanyaID
+       JOIN users u1 ON c.idCaller   = u1.alanyaID
        JOIN users u2 ON c.idReceiver = u2.alanyaID
        WHERE c.idCaller = ? OR c.idReceiver = ?
        ORDER BY c.created_at DESC
@@ -26,16 +26,21 @@ const createCall = async (req, res) => {
     const { idReceiver, type = 0 } = req.body;
     const idCaller = req.user.alanyaID;
 
+    if (!idReceiver) {
+      return res.status(400).json({ error: 'idReceiver required' });
+    }
+
     const [result] = await pool.execute(
-      `INSERT INTO callHistory (idCaller, idReceiver, type, status, created_at, start_time) 
+      `INSERT INTO callHistory (idCaller, idReceiver, type, status, created_at, start_time)
        VALUES (?, ?, ?, 0, NOW(), NOW())`,
       [idCaller, idReceiver, type]
     );
 
     const [rows] = await pool.execute(
-      `SELECT c.*, u.nom as receiver_nom, u.pseudo as receiver_pseudo 
-       FROM callHistory c JOIN users u ON c.idReceiver = u.alanyaID 
-       WHERE c.IDcall = ?`,
+      `SELECT c.*, u.nom as receiver_nom, u.pseudo as receiver_pseudo
+       FROM callHistory c
+       JOIN users u ON c.idReceiver = u.alanyaID
+       WHERE c.IDcall = ?`,   // ← CORRIGÉ : IDcall (bigint PK réelle)
       [result.insertId]
     );
 
@@ -47,13 +52,11 @@ const createCall = async (req, res) => {
 
 const endCall = async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id }       = req.params;
     const { status = 1 } = req.body;
-    const alanyaID = req.user.alanyaID;
+    const alanyaID     = req.user.alanyaID;
 
-    // On calcule la durée en secondes depuis start_time (début réel de l'appel
-    // = moment de décrochage, posé par defaut à created_at et mis à jour
-    // lors de l'answer côté socket). On ne touche SURTOUT PAS à start_time ici.
+    // CORRIGÉ : IDcall (nom réel de la PK dans la DB)
     await pool.execute(
       `UPDATE callHistory
        SET status = ?,
@@ -68,8 +71,4 @@ const endCall = async (req, res) => {
   }
 };
 
-module.exports = {
-  getCalls,
-  createCall,
-  endCall,
-};
+module.exports = { getCalls, createCall, endCall };

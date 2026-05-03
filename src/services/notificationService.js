@@ -1,17 +1,19 @@
 // src/services/notificationService.js
-const admin = require('firebase-admin');
+// Utilise Firebase Admin initialisé via src/config/firebase.js
+// (clé chargée depuis FIREBASE_SERVICE_ACCOUNT dans .env)
 
-// Firebase Admin est initialisé une seule fois dans server.js
-// Ce service utilise l'instance existante via admin.app()
+const admin = require('../config/firebase');
 
 const sendDataOnlyNotification = async (fcmToken, data = {}) => {
   if (!fcmToken || fcmToken === 'INDEFINI') return;
 
   try {
-    // ✅ PAS de champ "notification" → Flutter reçoit tout via onMessage
-    // Android ne génère pas de notif système, flutter_local_notifications gère l'affichage
+    if (!admin.apps.length) {
+      console.warn('[FCM] Firebase non initialisé — notification ignorée');
+      return;
+    }
+
     const message = {
-      
       token: fcmToken,
       data: Object.fromEntries(
         Object.entries(data).map(([k, v]) => [k, String(v)])
@@ -26,6 +28,7 @@ const sendDataOnlyNotification = async (fcmToken, data = {}) => {
 
     await admin.messaging().send(message);
   } catch (error) {
+    // Ne pas faire crasher le serveur pour une notif ratée
     console.error('[FCM] Send error:', error.message);
   }
 };
@@ -45,7 +48,6 @@ const sendToUser = async (alanyaID, data = {}) => {
   }
 };
 
-// ✅ Requête corrigée : utilise conv_participants (plus participantID)
 const notifyNewMessage = async (conversationID, senderID, senderName, content, type = 0) => {
   try {
     const pool = require('../config/db');
@@ -53,7 +55,6 @@ const notifyNewMessage = async (conversationID, senderID, senderName, content, t
       'SELECT alanyaID FROM conv_participants WHERE conversID = ? AND alanyaID != ?',
       [conversationID, senderID]
     );
-
     for (const p of participants) {
       await sendToUser(p.alanyaID, {
         type:           'message',

@@ -1,43 +1,15 @@
 // src/socket/handlers/meetings.js
-//
-// Protocole aligné sur MeetingService Flutter.
-//
-// ── Gestion de salle ─────────────────────────────────────────────────
-// Flutter → Serveur
-//   meeting:create        { meetingID, organiserID, meetingName }
-//   meeting:join_request  { meetingID, userID, userName }
-//   meeting:join_accept   { meetingID, userID }
-//   meeting:join_decline  { meetingID, userID }
-//   meeting:start         { meetingID }
-//   meeting:end           { meetingID }
-//   meeting:chat          { meetingID, userID, message }
-//   meeting:leave         { meetingID }
-//
-// ── WebRTC signaling (mesh) ───────────────────────────────────────────
-// Flutter → Serveur
-//   meeting:offer         { meetingID, toUserID, offer:{sdp,type} }
-//   meeting:answer        { meetingID, toUserID, answer:{sdp,type} }
-//   meeting:ice_candidate { meetingID, toUserID, candidate:{...} }
-//
-// Serveur → Flutter (WebRTC)
-//   meeting:offer         { fromUserID, offer:{sdp,type}, meetingID }
-//   meeting:answer        { fromUserID, answer:{sdp,type}, meetingID }
-//   meeting:ice_candidate { fromUserID, candidate:{...}, meetingID }
-//   meeting:user_left     { meetingID, userID }
+// meetingJoinRoom est maintenant exporté et DOIT être enregistré dans server.js
 
-// ── Helper ────────────────────────────────────────────────────────────
 function toInt(v) {
   const n = parseInt(v, 10);
   return isNaN(n) ? null : n;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-//  GESTION DE SALLE (handlers existants, inchangés)
-// ─────────────────────────────────────────────────────────────────────
-
 const meetingCreate = (io, socket, userSockets) => {
   socket.on('meeting:create', async (data) => {
     try {
+      if (!socket.authenticated) return;
       const { meetingID, organiserID, meetingName } = data;
       socket.join(`meeting_${meetingID}`);
       socket.currentMeetingID = meetingID;
@@ -48,9 +20,39 @@ const meetingCreate = (io, socket, userSockets) => {
   });
 };
 
+// CORRIGÉ : était défini mais jamais exporté ni enregistré dans server.js
+const meetingJoinRoom = (io, socket, userSockets) => {
+  socket.on('meeting:join_room', (data) => {
+    try {
+      if (!socket.authenticated) return;
+      const { meetingID, userID } = data;
+      const mID = toInt(meetingID);
+      const uID = toInt(userID) || socket.alanyaID;
+
+      if (!mID) {
+        return socket.emit('error', { message: 'meetingID requis' });
+      }
+
+      socket.join(`meeting_${mID}`);
+      socket.currentMeetingID = mID;
+
+      socket.emit('meeting:room_joined', { meetingID: mID, userID: uID });
+
+      socket.to(`meeting_${mID}`).emit('meeting:user_joined', {
+        meetingID: mID,
+        userID:    String(uID),
+      });
+    } catch (error) {
+      console.error('[Socket meeting:join_room]', error.message);
+      socket.emit('error', { message: error.message });
+    }
+  });
+};
+
 const meetingJoinRequest = (io, socket, userSockets) => {
   socket.on('meeting:join_request', async (data) => {
     try {
+      if (!socket.authenticated) return;
       const { meetingID, userID, userName } = data;
       socket.to(`meeting_${meetingID}`).emit('meeting:join_requested', {
         meetingID,
@@ -65,23 +67,20 @@ const meetingJoinRequest = (io, socket, userSockets) => {
 
 const meetingJoinAccept = (io, socket, userSockets) => {
   socket.on('meeting:join_accept', (data) => {
+    if (!socket.authenticated) return;
     const { meetingID, userID } = data;
     const userSocket = userSockets.get(toInt(userID));
 
     if (userSocket) {
       io.to(userSocket).emit('meeting:accepted', { meetingID });
     }
-    // L'organisateur rejoint sa propre room socket (déjà fait dans meeting:create)
-    // Les autres membres rejoignent dans meeting:join (côté Flutter) via REST + socket
-    socket.to(`meeting_${meetingID}`).emit('meeting:user_joined', {
-      meetingID,
-      userID,
-    });
+    socket.to(`meeting_${meetingID}`).emit('meeting:user_joined', { meetingID, userID });
   });
 };
 
 const meetingJoinDecline = (io, socket, userSockets) => {
   socket.on('meeting:join_decline', (data) => {
+    if (!socket.authenticated) return;
     const { meetingID, userID } = data;
     const userSocket = userSockets.get(toInt(userID));
 
@@ -93,6 +92,7 @@ const meetingJoinDecline = (io, socket, userSockets) => {
 
 const meetingStart = (io, socket, userSockets) => {
   socket.on('meeting:start', (data) => {
+    if (!socket.authenticated) return;
     const { meetingID } = data;
     io.to(`meeting_${meetingID}`).emit('meeting:started', { meetingID });
   });
@@ -100,10 +100,10 @@ const meetingStart = (io, socket, userSockets) => {
 
 const meetingEnd = (io, socket, userSockets) => {
   socket.on('meeting:end', (data) => {
+    if (!socket.authenticated) return;
     const { meetingID } = data;
     io.to(`meeting_${meetingID}`).emit('meeting:ended', { meetingID });
 
-    // Faire quitter tous les sockets de la room
     const roomSockets = io.sockets.adapter.rooms.get(`meeting_${meetingID}`);
     if (roomSockets) {
       for (const sid of roomSockets) {
@@ -119,6 +119,7 @@ const meetingEnd = (io, socket, userSockets) => {
 
 const meetingChat = (io, socket, userSockets) => {
   socket.on('meeting:chat', (data) => {
+    if (!socket.authenticated) return;
     const { meetingID, userID, message } = data;
     io.to(`meeting_${meetingID}`).emit('meeting:message', {
       meetingID,
@@ -129,19 +130,10 @@ const meetingChat = (io, socket, userSockets) => {
   });
 };
 
-// ─────────────────────────────────────────────────────────────────────
-//  HANDLERS WEBRTC  (NOUVEAUX)
-// ─────────────────────────────────────────────────────────────────────
-
-/**
- * Quitter la salle meeting côté WebRTC.
- * Notifie tous les autres participants pour qu'ils ferment
- * la PeerConnection correspondante.
- */
 const meetingLeave = (io, socket, userSockets) => {
   socket.on('meeting:leave', (data) => {
     try {
-      const meetingID = data?.meetingID ?? socket.currentMeetingID;
+      const meetingID = data?.meetingID || socket.currentMeetingID;
       if (!meetingID) return;
 
       socket.to(`meeting_${meetingID}`).emit('meeting:user_left', {
@@ -157,13 +149,10 @@ const meetingLeave = (io, socket, userSockets) => {
   });
 };
 
-/**
- * Relay SDP Offer d'un pair à un autre dans la même réunion.
- * { meetingID, toUserID, offer:{sdp, type} }
- */
 const meetingOffer = (io, socket, userSockets) => {
   socket.on('meeting:offer', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { meetingID, toUserID, offer } = data;
       const targetID = toInt(toUserID);
       if (!targetID || !offer) return;
@@ -182,13 +171,10 @@ const meetingOffer = (io, socket, userSockets) => {
   });
 };
 
-/**
- * Relay SDP Answer.
- * { meetingID, toUserID, answer:{sdp, type} }
- */
 const meetingAnswer = (io, socket, userSockets) => {
   socket.on('meeting:answer', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { meetingID, toUserID, answer } = data;
       const targetID = toInt(toUserID);
       if (!targetID || !answer) return;
@@ -207,13 +193,10 @@ const meetingAnswer = (io, socket, userSockets) => {
   });
 };
 
-/**
- * Relay ICE Candidate.
- * { meetingID, toUserID, candidate:{candidate, sdpMid, sdpMLineIndex} }
- */
 const meetingIceCandidate = (io, socket, userSockets) => {
   socket.on('meeting:ice_candidate', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { meetingID, toUserID, candidate } = data;
       const targetID = toInt(toUserID);
       if (!targetID || !candidate) return;
@@ -234,13 +217,13 @@ const meetingIceCandidate = (io, socket, userSockets) => {
 
 module.exports = {
   meetingCreate,
+  meetingJoinRoom,      // ← MAINTENANT EXPORTÉ
   meetingJoinRequest,
   meetingJoinAccept,
   meetingJoinDecline,
   meetingStart,
   meetingEnd,
   meetingChat,
-  // Nouveaux
   meetingLeave,
   meetingOffer,
   meetingAnswer,

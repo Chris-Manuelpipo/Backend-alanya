@@ -15,17 +15,98 @@ const joinConversation = (io, socket, userSockets) => {
 const messageSend = (io, socket, userSockets) => {
   socket.on('message:send', async (data) => {
     try {
-      const { conversationID, content, type, mediaUrl, senderID, senderName } = data;
-      io.to(`conversation_${conversationID}`).emit('message:received', {
-        conversationID,
-        content,
-        type,
-        mediaUrl,
-        senderID,
-        senderName,
-        sendAt: new Date(),
-      });
+      // ✅ Vérifier authentification socket
+      if (!socket.authenticated) {
+        return socket.emit('error', { 
+          message: 'Unauthenticated',
+          code: 'UNAUTHENTICATED',
+        });
+      }
+
+      const { conversationID, content, type = 0, mediaUrl, mediaName, mediaDuration, replyToID, replyToContent, isStatusReply = 0 } = data;
+      const senderID = socket.alanyaID; // ✅ Utiliser l'ID du socket authentifié
+
+      if (!conversationID || (!content && !mediaUrl)) {
+        return socket.emit('error', { 
+          message: 'conversationID and (content or mediaUrl) required' 
+        });
+      }
+
+      // ✅ ÉTAPE 1 : PERSISTER le message en DB
+      const [result] = await pool.execute(
+        `INSERT INTO message
+           (senderID, conversationID, content, type, status, sendAt,
+            mediaUrl, mediaName, mediaDuration, replyToID, replyToContent, isStatusReply)
+         VALUES (?, ?, ?, ?, 1, NOW(), ?, ?, ?, ?, ?, ?)`,
+        [
+          senderID, conversationID, content ?? null, type,
+          mediaUrl ?? null, mediaName ?? null, mediaDuration ?? null,
+          replyToID ?? null, replyToContent ?? null, isStatusReply,
+        ]
+      );
+
+      const msgID = result.insertId;
+
+      // ✅ ÉTAPE 2 : Mettre à jour résumé conversation
+      await pool.execute(
+        `UPDATE conversation
+         SET lastMessage = ?, lastMessageAt = NOW(),
+             lastMessageSenderID = ?, lastMessageType = ?
+         WHERE conversID = ?`,
+        [
+          content ? content.substring(0, 200) : (mediaName ?? 'Média'),
+          senderID, type, conversationID,
+        ]
+      );
+
+      // ✅ ÉTAPE 3 : Incrémenter compteur non-lus pour autres participants
+      await pool.execute(
+        'UPDATE conv_participants SET unreadCount = unreadCount + 1 WHERE conversID = ? AND alanyaID != ?',
+        [conversationID, senderID]
+      );
+
+      // ✅ ÉTAPE 4 : Récupérer message complet avec infos sender
+      const [rows] = await pool.execute(
+        `SELECT m.*, u.nom AS sender_nom, u.pseudo AS sender_pseudo, u.avatar_url AS sender_avatar
+         FROM message m
+         JOIN users u ON m.senderID = u.alanyaID
+         WHERE m.msgID = ?`,
+        [msgID]
+      );
+
+      const msg = rows[0];
+
+      // ✅ ÉTAPE 5 : BROADCAST le message via Socket.IO (maintenant persistent!)
+      io.to(`conversation_${conversationID}`).emit('message:received', msg);
+
+      // Aussi envoyer directement aux sockets des participants
+      const [participants] = await pool.execute(
+        'SELECT alanyaID FROM conv_participants WHERE conversID = ? AND alanyaID != ?',
+        [conversationID, senderID]
+      );
+
+      for (const p of participants) {
+        const sid = userSockets.get(p.alanyaID);
+        if (sid) io.to(sid).emit('message:received', msg);
+      }
+
+      // ✅ ÉTAPE 6 : Notif FCM aux autres participants
+      const [sender] = await pool.execute(
+        'SELECT nom FROM users WHERE alanyaID = ?', [senderID]
+      );
+      const senderName = sender[0]?.nom ?? 'Talky';
+      
+      // Import async pour éviter circular dependency
+      setTimeout(() => {
+        const { notifyNewMessage } = require('../../services/notificationService');
+        notifyNewMessage(conversationID, senderID, senderName, content, type).catch(e => 
+          console.warn('[FCM notification]', e.message)
+        );
+      }, 0);
+
+      socket.emit('message:sent', { msgID, ...msg });
     } catch (error) {
+      console.error('[Socket message:send]', error.message);
       socket.emit('error', { message: error.message });
     }
   });

@@ -1,9 +1,8 @@
 // src/socket/handlers/calls.js
 //
-// Protocole aligné sur Flutter CallService (call_service.dart).
+// Protocole aligné sur Flutter CallService.
 //
-// ── Appels 1-à-1 ─────────────────────────────────────────────────────
-//
+// ── Appels 1-à-1 ──────────────────────────────────────────────────────
 // Flutter → Serveur
 //   call_user        { targetUserId, callerId, callerName, callerPhoto, isVideo, offer:{sdp,type} }
 //   answer_call      { callerId, answer:{sdp,type} }
@@ -18,8 +17,7 @@
 //   call_ended       {}
 //   ice_candidate    { candidate:{candidate,sdpMid,sdpMLineIndex} }
 //
-// ── Appels de groupe ─────────────────────────────────────────────────
-//
+// ── Appels de groupe ──────────────────────────────────────────────────
 // Flutter → Serveur
 //   create_group_call  { roomId, callerId, callerName, callerPhoto, isVideo, targetUserIds:[] }
 //   join_group_call    { roomId, userId, userName, userPhoto }
@@ -41,11 +39,10 @@
 
 const pool = require('../../config/db');
 
-// ── State en mémoire des rooms de groupe ─────────────────────────────
+// State en mémoire des rooms de groupe
 // roomId → Map<alanyaID, { userName, userPhoto }>
 const groupRooms = new Map();
 
-// ── Helper ────────────────────────────────────────────────────────────
 function toInt(v) {
   const n = parseInt(v, 10);
   return isNaN(n) ? null : n;
@@ -58,42 +55,39 @@ function toInt(v) {
 const callUser = (io, socket, userSockets) => {
   socket.on('call_user', async (data) => {
     try {
+      if (!socket.authenticated) return;
+
       const { targetUserId, callerId, callerName, callerPhoto, isVideo, offer } = data;
-
       const targetID = toInt(targetUserId);
-      const callerID = toInt(callerId);
+      const callerID = toInt(callerId) || socket.alanyaID;
 
-      if (!targetID || !callerID || !offer) {
+      if (!targetID || !offer) {
         socket.emit('call_failed', { reason: 'Données d\'appel invalides' });
         return;
       }
 
-      // Créer l'entrée callHistory en base (status 0 = missed par défaut,
-      // mis à jour lors du décrochage ou de la fin)
       try {
         const [result] = await pool.execute(
           `INSERT INTO callHistory (idCaller, idReceiver, type, status, created_at, start_time)
            VALUES (?, ?, ?, 0, NOW(), NOW())`,
           [callerID, targetID, isVideo ? 1 : 0]
         );
-        // On stocke l'IDcall sur le socket pour le retrouver lors de end_call
         socket.currentCallID = result.insertId;
+        socket.currentCallTarget = targetID;
       } catch (dbErr) {
         console.warn('[Socket call_user] DB insert failed:', dbErr.message);
-        // On continue — le signaling fonctionne même si le log DB échoue
       }
 
       const targetSocketId = userSockets.get(targetID);
       if (targetSocketId) {
         io.to(targetSocketId).emit('incoming_call', {
           callerId:    String(callerID),
-          callerName:  callerName  ?? '',
-          callerPhoto: callerPhoto ?? null,
-          isVideo:     isVideo     ?? false,
-          offer,                          // ← SDP offer forwardé tel quel
+          callerName:  callerName  || '',
+          callerPhoto: callerPhoto || null,
+          isVideo:     isVideo     || false,
+          offer,
         });
       } else {
-        // Destinataire hors ligne — FCM géré côté Flutter (FcmSender)
         socket.emit('call_failed', { reason: 'Utilisateur non disponible' });
       }
     } catch (error) {
@@ -106,20 +100,27 @@ const callUser = (io, socket, userSockets) => {
 const answerCall = (io, socket, userSockets) => {
   socket.on('answer_call', async (data) => {
     try {
+      if (!socket.authenticated) return;
       const { callerId, answer } = data;
 
-      const callerID = toInt(callerId);
+      const callerID   = toInt(callerId);
+      const receiverID = socket.alanyaID;
       if (!callerID || !answer) return;
 
-      // Mettre à jour le vrai début de l'appel (décrochage)
-      // On cherche l'IDcall le plus récent entre ces deux utilisateurs
+      // CORRIGÉ : subquery pour éviter UPDATE + ORDER BY + LIMIT
       try {
         await pool.execute(
           `UPDATE callHistory
            SET start_time = NOW(), status = 1
-           WHERE idCaller = ? AND idReceiver = ?
-           ORDER BY created_at DESC LIMIT 1`,
-          [callerID, toInt(socket.alanyaID)]
+           WHERE IDcall = (
+             SELECT IDcall FROM (
+               SELECT IDcall FROM callHistory
+               WHERE idCaller = ? AND idReceiver = ?
+               ORDER BY created_at DESC
+               LIMIT 1
+             ) AS sub
+           )`,
+          [callerID, receiverID]
         );
       } catch (dbErr) {
         console.warn('[Socket answer_call] DB update failed:', dbErr.message);
@@ -127,7 +128,7 @@ const answerCall = (io, socket, userSockets) => {
 
       const callerSocketId = userSockets.get(callerID);
       if (callerSocketId) {
-        io.to(callerSocketId).emit('call_answered', { answer }); // ← SDP answer forwardé
+        io.to(callerSocketId).emit('call_answered', { answer });
       }
     } catch (error) {
       console.error('[Socket answer_call]', error.message);
@@ -138,18 +139,26 @@ const answerCall = (io, socket, userSockets) => {
 const rejectCall = (io, socket, userSockets) => {
   socket.on('reject_call', async (data) => {
     try {
+      if (!socket.authenticated) return;
       const { callerId } = data;
-      const callerID = toInt(callerId);
+      const callerID   = toInt(callerId);
+      const receiverID = socket.alanyaID;
       if (!callerID) return;
 
-      // Marquer l'appel comme refusé en base
+      // CORRIGÉ : subquery pour éviter UPDATE + ORDER BY + LIMIT
       try {
         await pool.execute(
           `UPDATE callHistory
            SET status = 2
-           WHERE idCaller = ? AND idReceiver = ?
-           ORDER BY created_at DESC LIMIT 1`,
-          [callerID, toInt(socket.alanyaID)]
+           WHERE IDcall = (
+             SELECT IDcall FROM (
+               SELECT IDcall FROM callHistory
+               WHERE idCaller = ? AND idReceiver = ?
+               ORDER BY created_at DESC
+               LIMIT 1
+             ) AS sub
+           )`,
+          [callerID, receiverID]
         );
       } catch (dbErr) {
         console.warn('[Socket reject_call] DB update failed:', dbErr.message);
@@ -168,6 +177,7 @@ const rejectCall = (io, socket, userSockets) => {
 const iceCandidate = (io, socket, userSockets) => {
   socket.on('ice_candidate', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { targetUserId, candidate } = data;
       const targetID = toInt(targetUserId);
       if (!targetID || !candidate) return;
@@ -185,20 +195,26 @@ const iceCandidate = (io, socket, userSockets) => {
 const endCall = (io, socket, userSockets) => {
   socket.on('end_call', async (data) => {
     try {
+      if (!socket.authenticated) return;
       const { targetUserId } = data;
-      const targetID  = toInt(targetUserId);
-      const callerID  = socket.alanyaID;
+      const targetID = toInt(targetUserId);
+      const callerID = socket.alanyaID;
 
-      // Calculer la durée et fermer l'entrée en base
       if (callerID) {
         try {
           await pool.execute(
             `UPDATE callHistory
              SET duree = GREATEST(0, TIMESTAMPDIFF(SECOND, start_time, NOW()))
-             WHERE (idCaller = ? OR idReceiver = ?)
-               AND (idCaller = ? OR idReceiver = ?)
-             ORDER BY created_at DESC LIMIT 1`,
-            [callerID, callerID, targetID ?? callerID, targetID ?? callerID]
+             WHERE IDcall = (
+               SELECT IDcall FROM (
+                 SELECT IDcall FROM callHistory
+                 WHERE (idCaller = ? OR idReceiver = ?)
+                   AND (idCaller = ? OR idReceiver = ?)
+                 ORDER BY created_at DESC
+                 LIMIT 1
+               ) AS sub
+             )`,
+            [callerID, callerID, targetID || callerID, targetID || callerID]
           );
         } catch (dbErr) {
           console.warn('[Socket end_call] DB update failed:', dbErr.message);
@@ -212,7 +228,8 @@ const endCall = (io, socket, userSockets) => {
         }
       }
 
-      socket.currentCallID = null;
+      socket.currentCallID     = null;
+      socket.currentCallTarget = null;
     } catch (error) {
       console.error('[Socket end_call]', error.message);
     }
@@ -226,22 +243,20 @@ const endCall = (io, socket, userSockets) => {
 const createGroupCall = (io, socket, userSockets) => {
   socket.on('create_group_call', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { roomId, callerId, callerName, callerPhoto, isVideo, targetUserIds } = data;
       if (!roomId || !Array.isArray(targetUserIds)) return;
 
-      const callerID = toInt(callerId);
-      if (!callerID) return;
+      const callerID = toInt(callerId) || socket.alanyaID;
 
-      // Initialiser la room avec le créateur
       groupRooms.set(roomId, new Map([[
         callerID,
-        { userName: callerName ?? '', userPhoto: callerPhoto ?? null }
+        { userName: callerName || '', userPhoto: callerPhoto || null },
       ]]));
 
       socket.join(`group_${roomId}`);
       socket.currentGroupRoom = roomId;
 
-      // Notifier chaque participant ciblé
       for (const uid of targetUserIds) {
         const targetID = toInt(uid);
         if (!targetID) continue;
@@ -249,13 +264,12 @@ const createGroupCall = (io, socket, userSockets) => {
         if (targetSocketId) {
           io.to(targetSocketId).emit('group_call_invite', {
             callerId:    String(callerID),
-            callerName:  callerName  ?? '',
-            callerPhoto: callerPhoto ?? null,
-            isVideo:     isVideo     ?? false,
+            callerName:  callerName  || '',
+            callerPhoto: callerPhoto || null,
+            isVideo:     isVideo     || false,
             roomId,
           });
         }
-        // Hors ligne → FCM géré côté Flutter (FcmSender.sendGroupCallNotification)
       }
     } catch (error) {
       console.error('[Socket create_group_call]', error.message);
@@ -266,32 +280,29 @@ const createGroupCall = (io, socket, userSockets) => {
 const joinGroupCall = (io, socket, userSockets) => {
   socket.on('join_group_call', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { roomId, userId, userName, userPhoto } = data;
       if (!roomId || !userId) return;
 
-      const userID = toInt(userId);
-      if (!userID) return;
+      const userID = toInt(userId) || socket.alanyaID;
 
-      // S'assurer que la room existe
       if (!groupRooms.has(roomId)) {
         groupRooms.set(roomId, new Map());
       }
 
       const room = groupRooms.get(roomId);
-      room.set(userID, { userName: userName ?? '', userPhoto: userPhoto ?? null });
+      room.set(userID, { userName: userName || '', userPhoto: userPhoto || null });
 
       socket.join(`group_${roomId}`);
       socket.currentGroupRoom = roomId;
 
-      // Notifier les autres membres que quelqu'un a rejoint
       socket.to(`group_${roomId}`).emit('group_user_joined', {
         roomId,
         userId:    String(userID),
-        userName:  userName  ?? '',
-        userPhoto: userPhoto ?? null,
+        userName:  userName  || '',
+        userPhoto: userPhoto || null,
       });
 
-      // Envoyer la liste des participants actuels au nouvel entrant
       const participants = Array.from(room.keys()).map(String);
       socket.emit('group_participants', { roomId, participants });
     } catch (error) {
@@ -303,7 +314,7 @@ const joinGroupCall = (io, socket, userSockets) => {
 const leaveGroupCall = (io, socket, userSockets) => {
   socket.on('leave_group_call', (data) => {
     try {
-      const { roomId } = data ?? {};
+      const { roomId } = data || {};
       const room = roomId ? groupRooms.get(roomId) : null;
 
       if (room && socket.alanyaID) {
@@ -311,7 +322,7 @@ const leaveGroupCall = (io, socket, userSockets) => {
         if (room.size === 0) groupRooms.delete(roomId);
       }
 
-      const rId = roomId ?? socket.currentGroupRoom;
+      const rId = roomId || socket.currentGroupRoom;
       if (rId) {
         socket.to(`group_${rId}`).emit('group_user_left', {
           roomId: rId,
@@ -330,14 +341,13 @@ const leaveGroupCall = (io, socket, userSockets) => {
 const endGroupCall = (io, socket, userSockets) => {
   socket.on('end_group_call', (data) => {
     try {
-      const { roomId } = data ?? {};
-      const rId = roomId ?? socket.currentGroupRoom;
+      const { roomId } = data || {};
+      const rId = roomId || socket.currentGroupRoom;
       if (!rId) return;
 
       groupRooms.delete(rId);
       io.to(`group_${rId}`).emit('group_call_ended', {});
 
-      // Faire quitter tous les sockets de la room
       const roomSockets = io.sockets.adapter.rooms.get(`group_${rId}`);
       if (roomSockets) {
         for (const sid of roomSockets) {
@@ -354,11 +364,10 @@ const endGroupCall = (io, socket, userSockets) => {
   });
 };
 
-// ── WebRTC peer-to-peer dans le groupe (relayé par le serveur) ────────
-
 const groupOffer = (io, socket, userSockets) => {
   socket.on('group_offer', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { toUserId, fromUserId, offer, roomId } = data;
       const targetID = toInt(toUserId);
       if (!targetID || !offer) return;
@@ -366,7 +375,7 @@ const groupOffer = (io, socket, userSockets) => {
       const targetSocketId = userSockets.get(targetID);
       if (targetSocketId) {
         io.to(targetSocketId).emit('group_offer', {
-          fromUserId: String(fromUserId ?? socket.alanyaID),
+          fromUserId: String(fromUserId || socket.alanyaID),
           offer,
           roomId,
         });
@@ -380,6 +389,7 @@ const groupOffer = (io, socket, userSockets) => {
 const groupAnswer = (io, socket, userSockets) => {
   socket.on('group_answer', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { toUserId, fromUserId, answer, roomId } = data;
       const targetID = toInt(toUserId);
       if (!targetID || !answer) return;
@@ -387,7 +397,7 @@ const groupAnswer = (io, socket, userSockets) => {
       const targetSocketId = userSockets.get(targetID);
       if (targetSocketId) {
         io.to(targetSocketId).emit('group_answer', {
-          fromUserId: String(fromUserId ?? socket.alanyaID),
+          fromUserId: String(fromUserId || socket.alanyaID),
           answer,
           roomId,
         });
@@ -401,6 +411,7 @@ const groupAnswer = (io, socket, userSockets) => {
 const groupIceCandidate = (io, socket, userSockets) => {
   socket.on('group_ice_candidate', (data) => {
     try {
+      if (!socket.authenticated) return;
       const { toUserId, fromUserId, candidate, roomId } = data;
       const targetID = toInt(toUserId);
       if (!targetID || !candidate) return;
@@ -408,7 +419,7 @@ const groupIceCandidate = (io, socket, userSockets) => {
       const targetSocketId = userSockets.get(targetID);
       if (targetSocketId) {
         io.to(targetSocketId).emit('group_ice_candidate', {
-          fromUserId: String(fromUserId ?? socket.alanyaID),
+          fromUserId: String(fromUserId || socket.alanyaID),
           candidate,
           roomId,
         });

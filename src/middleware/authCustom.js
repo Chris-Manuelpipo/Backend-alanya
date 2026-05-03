@@ -1,8 +1,20 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'talky-secret-key-change-in-production';
+const JWT_SECRET         = process.env.JWT_SECRET          || 'talky-secret-key-change-in-production';
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET  || 'talky-refresh-secret-change-in-production';
 
+// Access token : 15 minutes (court — sécurité)
+const generateAccessToken = (payload) => {
+  return jwt.sign({ ...payload, type: 'access' }, JWT_SECRET, { expiresIn: '15m' });
+};
+
+// Refresh token : 30 jours
+const generateRefreshToken = (payload) => {
+  return jwt.sign({ ...payload, type: 'refresh' }, JWT_REFRESH_SECRET, { expiresIn: '30d' });
+};
+
+// Middleware pour les routes protégées (access token uniquement)
 const authCustom = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -11,15 +23,28 @@ const authCustom = async (req, res, next) => {
     }
 
     const token = authHeader.split('Bearer ')[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Token expired', code: 'TOKEN_EXPIRED' });
+      }
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    if (decoded.type !== 'access') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
 
     const [rows] = await pool.execute(
-      'SELECT alanyaID, alanyaPhone, email FROM users WHERE alanyaID = ?',
+      'SELECT alanyaID, alanyaPhone, email FROM users WHERE alanyaID = ? AND exclus = 0',
       [decoded.alanyaID]
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({ error: 'User not found in DB' });
+      return res.status(401).json({ error: 'User not found or banned' });
     }
 
     req.user = {
@@ -30,12 +55,8 @@ const authCustom = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('[AuthCustom] ERROR:', error.message);
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    return res.status(401).json({ error: 'Authentication failed' });
   }
 };
 
-const generateToken = (payload) => {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
-};
-
-module.exports = { authCustom, generateToken, JWT_SECRET };
+module.exports = { authCustom, generateAccessToken, generateRefreshToken, JWT_SECRET, JWT_REFRESH_SECRET };

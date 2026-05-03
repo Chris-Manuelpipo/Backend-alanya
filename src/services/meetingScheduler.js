@@ -30,24 +30,30 @@ const stopMeetingScheduler = () => {
 
 const checkAndNotifyUpcomingMeetings = async () => {
   try {
-    // Trouver les réunions qui commencent dans les 10 minutes (utc)
-    // et pour lesquelles aucune notification n'a été envoyée
+    // Trouver les réunions qui commencent dans les 10 minutes (UTC)
+    // et pour lesquelles aucune notification n'a été envoyée (reminder_sent = 0)
     const [meetings] = await pool.execute(
       `SELECT m.idMeeting, m.objet, m.start_time, m.idOrganiser, u.nom as organiser_nom
        FROM meeting m
        JOIN users u ON m.idOrganiser = u.alanyaID
        WHERE m.isEnd = 0
          AND m.start_time > NOW() 
-          AND m.start_time <= DATE_ADD(NOW(), INTERVAL 10 MINUTE)
-         AND NOT EXISTS (
-           SELECT 1 FROM participant p
-           WHERE p.idMeeting = m.idMeeting 
-             AND p.status = 99  -- Signal qu'on a notifié 10min avant
-         )`
+         AND m.start_time <= DATE_ADD(NOW(), INTERVAL 10 MINUTE)
+         AND m.reminder_sent = 0`
     );
 
+    if (meetings.length === 0) {
+      return; // Rien à notifier
+    }
+
+    console.log(`[MeetingScheduler] ${meetings.length} réunion(s) à notifier`);
+
     for (const meeting of meetings) {
-      // Notifier tous les participants acceptés et en attente
+      console.log(
+        `[MeetingScheduler] Traitement de la réunion: idMeeting=${meeting.idMeeting}, objet='${meeting.objet}'`
+      );
+
+      // Trouver tous les participants acceptés et en attente (status 0 ou 1)
       const [participants] = await pool.execute(
         `SELECT DISTINCT p.IDparticipant
          FROM participant p
@@ -55,6 +61,15 @@ const checkAndNotifyUpcomingMeetings = async () => {
         [meeting.idMeeting]
       );
 
+      if (participants.length === 0) {
+        console.log(`[MeetingScheduler] Aucun participant pour réunion ${meeting.idMeeting}`);
+      } else {
+        console.log(
+          `[MeetingScheduler] ${participants.length} participant(s) à notifier pour réunion ${meeting.idMeeting}`
+        );
+      }
+
+      // Notifier chaque participant
       for (const p of participants) {
         try {
           await notifyMeetingReminder(
@@ -62,20 +77,32 @@ const checkAndNotifyUpcomingMeetings = async () => {
             meeting.objet,
             meeting.organiser_nom
           );
+          console.log(
+            `[MeetingScheduler] Notification envoyée au participant ${p.IDparticipant} pour réunion ${meeting.idMeeting}`
+          );
         } catch (error) {
           console.error(
-            `[MeetingScheduler] Erreur notification participant ${p.IDparticipant}:`,
+            `[MeetingScheduler] Erreur notification participant ${p.IDparticipant} pour réunion ${meeting.idMeeting}:`,
             error.message
           );
         }
       }
 
-      // Marquer comme notifié en créant une pseudo-entrée participant
-      // Ou ajouter une colonne reminder_sent à la table meeting (meilleure approche)
-      // Pour l'instant, on log juste
-      console.log(
-        `[MeetingScheduler] Notification de rappel envoyée pour réunion ${meeting.idMeeting}`
-      );
+      // Marquer la réunion comme rappel notifié
+      try {
+        await pool.execute(
+          `UPDATE meeting SET reminder_sent = 1 WHERE idMeeting = ?`,
+          [meeting.idMeeting]
+        );
+        console.log(
+          `[MeetingScheduler] ✓ Rappel notifié pour réunion idMeeting=${meeting.idMeeting}, objet='${meeting.objet}'`
+        );
+      } catch (error) {
+        console.error(
+          `[MeetingScheduler] Erreur mise à jour reminder_sent pour réunion ${meeting.idMeeting}:`,
+          error.message
+        );
+      }
     }
   } catch (error) {
     console.error('[MeetingScheduler] Erreur checkAndNotifyUpcomingMeetings:', error.message);
